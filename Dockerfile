@@ -29,7 +29,7 @@ RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
 # Expose port
-EXPOSE 5000
+EXPOSE 8080
 
 # Run gunicorn
 CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]
