@@ -53,7 +53,7 @@ def github_login():
     auth_url = f'https://github.com/login/oauth/authorize?client_id={app.config["GITHUB_CLIENT_ID"]}&state={state}&scope=repo,user'
     return redirect(auth_url)
 
-@app.route('/github/callback')
+@app.route('/login/github/callback')  # Updated route to match GitHub's callback URL
 def github_callback():
     if 'error' in request.args:
         flash(f'Error during GitHub authentication: {request.args["error"]}', 'danger')
