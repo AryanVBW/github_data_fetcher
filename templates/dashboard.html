@@ -1,0 +1,343 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - GitHub Data Fetcher{% endblock %}
+
+{% block extra_css %}
+<style>
+    .stat-card {
+        position: relative;
+        overflow: hidden;
+        transition: transform 0.2s ease;
+    }
+
+    .stat-card:hover {
+        transform: translateY(-5px);
+    }
+
+    .stat-card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: radial-gradient(circle at var(--x, 50%) var(--y, 50%), 
+                                  rgba(88, 166, 255, 0.1) 0%,
+                                  transparent 50%);
+        opacity: 0;
+        transition: opacity 0.3s ease;
+        pointer-events: none;
+    }
+
+    .stat-card:hover::before {
+        opacity: 1;
+    }
+
+    .constellation {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        top: 0;
+        left: 0;
+        pointer-events: none;
+        z-index: 0;
+    }
+
+    .constellation-line {
+        stroke: rgba(88, 166, 255, 0.2);
+        stroke-width: 1;
+    }
+
+    .constellation-point {
+        fill: rgba(88, 166, 255, 0.3);
+    }
+
+    .activity-chart {
+        background-color: var(--card-bg);
+        border-radius: 6px;
+        padding: 1rem;
+    }
+
+    .chart-tooltip {
+        background-color: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        padding: 0.5rem;
+        border-radius: 4px;
+        box-shadow: var(--box-shadow);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1 class="mb-4">Dashboard</h1>
+        {% if data.current_status == 'Refreshing' %}
+        <div class="alert alert-info">
+            <div class="d-flex align-items-center">
+                <div class="loading me-3"></div>
+                <div>
+                    Refreshing data... Current repository: {{ data.progress.current_repo }}
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row g-4">
+    <!-- Overview Stats -->
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body">
+                <h6 class="text-secondary mb-2">Public Repositories</h6>
+                <h3 class="mb-0">{{ data.repositories|length }}</h3>
+                <svg class="constellation"></svg>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body">
+                <h6 class="text-secondary mb-2">Total Stars</h6>
+                <h3 class="mb-0">{{ data.total_stars|default(0) }}</h3>
+                <svg class="constellation"></svg>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body">
+                <h6 class="text-secondary mb-2">Total Commits</h6>
+                <h3 class="mb-0">{{ data.total_commits|default(0) }}</h3>
+                <svg class="constellation"></svg>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body">
+                <h6 class="text-secondary mb-2">Total Pull Requests</h6>
+                <h3 class="mb-0">{{ data.total_prs|default(0) }}</h3>
+                <svg class="constellation"></svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Activity -->
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title mb-4">Recent Activity</h5>
+                <div class="activity-chart" id="activityChart"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Top Languages -->
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title mb-4">Top Languages</h5>
+                <div id="languagesChart"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Repositories -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title mb-4">Recent Repositories</h5>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Repository</th>
+                                <th>Language</th>
+                                <th>Stars</th>
+                                <th>Commits</th>
+                                <th>Last Updated</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for repo in data.repositories[:5] %}
+                            <tr>
+                                <td>
+                                    <a href="{{ repo.html_url }}" target="_blank" class="text-accent-primary">
+                                        {{ repo.full_name }}
+                                    </a>
+                                </td>
+                                <td>{{ repo.language or 'N/A' }}</td>
+                                <td>{{ repo.stargazers_count }}</td>
+                                <td>{{ repo.commits_count|default(0) }}</td>
+                                <td>{{ repo.updated_at|datetime }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Create constellations in stat cards
+    document.querySelectorAll('.stat-card').forEach(card => {
+        const svg = card.querySelector('.constellation');
+        const width = card.offsetWidth;
+        const height = card.offsetHeight;
+        const points = [];
+        const numPoints = 5;
+        
+        svg.setAttribute('width', width);
+        svg.setAttribute('height', height);
+        
+        // Generate random points
+        for (let i = 0; i < numPoints; i++) {
+            points.push({
+                x: Math.random() * width,
+                y: Math.random() * height
+            });
+        }
+        
+        // Draw lines between points
+        for (let i = 0; i < points.length - 1; i++) {
+            const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            line.setAttribute('x1', points[i].x);
+            line.setAttribute('y1', points[i].y);
+            line.setAttribute('x2', points[i + 1].x);
+            line.setAttribute('y2', points[i + 1].y);
+            line.setAttribute('class', 'constellation-line');
+            svg.appendChild(line);
+        }
+        
+        // Draw points
+        points.forEach(point => {
+            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            circle.setAttribute('cx', point.x);
+            circle.setAttribute('cy', point.y);
+            circle.setAttribute('r', 2);
+            circle.setAttribute('class', 'constellation-point');
+            svg.appendChild(circle);
+        });
+        
+        // Handle hover effect
+        card.addEventListener('mousemove', (e) => {
+            const rect = card.getBoundingClientRect();
+            const x = ((e.clientX - rect.left) / rect.width) * 100;
+            const y = ((e.clientY - rect.top) / rect.height) * 100;
+            card.style.setProperty('--x', `${x}%`);
+            card.style.setProperty('--y', `${y}%`);
+        });
+    });
+
+    // Activity Chart
+    const activityCtx = document.getElementById('activityChart').getContext('2d');
+    const activityData = {{ data.activity_data|tojson|safe if data.activity_data else '[]' }};
+    
+    new Chart(activityCtx, {
+        type: 'line',
+        data: {
+            labels: activityData.map(d => d.date),
+            datasets: [{
+                label: 'Commits',
+                data: activityData.map(d => d.commits),
+                borderColor: 'rgba(88, 166, 255, 1)',
+                backgroundColor: 'rgba(88, 166, 255, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    backgroundColor: 'var(--bg-secondary)',
+                    titleColor: 'var(--text-primary)',
+                    bodyColor: 'var(--text-primary)',
+                    borderColor: 'var(--border-color)',
+                    borderWidth: 1,
+                    padding: 10,
+                    displayColors: false
+                }
+            },
+            scales: {
+                x: {
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.1)'
+                    },
+                    ticks: {
+                        color: 'var(--text-secondary)'
+                    }
+                },
+                y: {
+                    beginAtZero: true,
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.1)'
+                    },
+                    ticks: {
+                        color: 'var(--text-secondary)'
+                    }
+                }
+            }
+        }
+    });
+
+    // Languages Chart
+    const languagesCtx = document.getElementById('languagesChart').getContext('2d');
+    const languagesData = {{ data.languages_data|tojson|safe if data.languages_data else '{}' }};
+    
+    new Chart(languagesCtx, {
+        type: 'doughnut',
+        data: {
+            labels: Object.keys(languagesData),
+            datasets: [{
+                data: Object.values(languagesData),
+                backgroundColor: [
+                    'rgba(88, 166, 255, 0.8)',
+                    'rgba(191, 74, 249, 0.8)',
+                    'rgba(255, 123, 0, 0.8)',
+                    'rgba(0, 200, 83, 0.8)',
+                    'rgba(255, 213, 0, 0.8)'
+                ]
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    position: 'right',
+                    labels: {
+                        color: 'var(--text-primary)',
+                        padding: 10
+                    }
+                },
+                tooltip: {
+                    backgroundColor: 'var(--bg-secondary)',
+                    titleColor: 'var(--text-primary)',
+                    bodyColor: 'var(--text-primary)',
+                    borderColor: 'var(--border-color)',
+                    borderWidth: 1,
+                    padding: 10
+                }
+            }
+        }
+    });
+});
+</script>
+{% endblock %}

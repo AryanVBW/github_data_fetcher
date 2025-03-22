@@ -13,18 +13,28 @@ from tqdm import tqdm
 import atexit
 import threading
 import flask
-from flask import Flask, render_template, jsonify, send_from_directory
+from flask import Flask, render_template, jsonify, send_from_directory, redirect, url_for, session, request
 import socket
 import webbrowser
+import uuid
+import hashlib
+from functools import wraps
 
 class GitHubDataFetcher:
-    def __init__(self, token):
+    def __init__(self, token=None):
         """Initialize with GitHub personal access token."""
         self.token = token
-        self.headers = {
-            'Authorization': f'token {token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        if token:
+            self.headers = {
+                'Authorization': f'token {token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        else:
+            # No authentication - will hit rate limits quickly
+            self.headers = {
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
         self.base_url = 'https://api.github.com'
         self.user_data = None
         self.rate_limit_remaining = None
@@ -65,8 +75,13 @@ class GitHubDataFetcher:
                 'current_repo': '',
                 'rate_limit': 0,
                 'eta': 'Unknown'
-            }
+            },
+            'recent_activity': []  # Added for recent activity data
         }
+        
+        # GitHub OAuth settings
+        self.github_client_id = os.environ.get('GITHUB_CLIENT_ID')
+        self.github_client_secret = os.environ.get('GITHUB_CLIENT_SECRET')
         
         # Load any existing data
         self.load_checkpoint()
@@ -78,7 +93,55 @@ class GitHubDataFetcher:
         self.web_server_thread = None
         self.web_server_port = self.find_available_port(5000, 5100)
         self.web_server_url = f"http://localhost:{self.web_server_port}"
+        
+        # Set up the scheduled refresh timer
+        self.last_refresh_time = time.time()
+        self.refresh_interval = 24 * 60 * 60  # 24 hours in seconds
+        
+        # If token exists, verify it before proceeding
+        if self.token:
+            if not self.verify_token():
+                self.logger.error("GitHub token authentication failed. Please check your token.")
+                self.collected_data['current_status'] = 'Authentication Error'
+            else:
+                self.logger.info("GitHub token authentication successful.")
+        else:
+            self.logger.warning("No GitHub token provided. Will use OAuth for authentication.")
+        
+        # Start the web server
         self.start_web_server()
+
+    def verify_token(self):
+        """Verify that the GitHub token is valid and has the necessary permissions."""
+        if not self.token:
+            self.logger.warning("No GitHub token provided. Running unauthenticated (limited API access).")
+            return False
+            
+        try:
+            response = requests.get(
+                f"{self.base_url}/user", 
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                self.logger.info(f"Authenticated as: {user_data.get('login', 'Unknown')}")
+                self.user_data = user_data  # Store user data
+                return True
+            elif response.status_code == 401:
+                self.logger.error("Authentication failed: Invalid or expired token")
+                return False
+            elif response.status_code == 403:
+                self.logger.error("Authentication failed: Token lacks required permissions or rate limit exceeded")
+                return False
+            else:
+                self.logger.error(f"Authentication check failed with status code: {response.status_code}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Error verifying token: {e}")
+            return False
 
     def find_available_port(self, start_port, end_port):
         """Find an available port in the given range."""
@@ -98,63 +161,188 @@ class GitHubDataFetcher:
                         template_folder=self.templates_dir,
                         static_folder=self.static_dir)
             
+            # Set up a secret key for sessions
+            app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+            
+            # Middleware to check login status
+            def login_required(f):
+                @wraps(f)
+                def decorated_function(*args, **kwargs):
+                    if 'user_id' not in session and 'github_token' not in session and 'demo_mode' not in session:
+                        return redirect(url_for('login'))
+                    return f(*args, **kwargs)
+                return decorated_function
+            
             @app.route('/')
+            @login_required
             def home():
                 return render_template('index.html')
             
-            @app.route('/api/data')
-            def get_data():
-                # Update progress information
-                repos_count = len(self.collected_data['repositories'])
-                processed_count = len(self.collected_data['processed_repos'])
-                total_count = self.collected_data['progress']['total_repos']
+            @app.route('/login')
+            def login():
+                return render_template('login.html')
+            
+            @app.route('/login/github')
+            def github_login():
+                if not self.github_client_id:
+                    return "GitHub OAuth is not configured. Please set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET environment variables."
                 
-                if total_count > 0:
-                    percentage = int((processed_count / total_count) * 100)
-                else:
-                    percentage = 0
-                    
-                # Format the data for JSON response
+                # Generate a random state value for CSRF protection
+                state = hashlib.sha256(os.urandom(1024)).hexdigest()
+                session['oauth_state'] = state
+                
+                # Redirect to GitHub's authorization page
+                return redirect(
+                    f"https://github.com/login/oauth/authorize"
+                    f"?client_id={self.github_client_id}"
+                    f"&scope=repo,read:user,user:email"
+                    f"&state={state}"
+                )
+            
+            @app.route('/github/callback')
+            def github_callback():
+                # Verify state parameter to prevent CSRF
+                if 'oauth_state' not in session or request.args.get('state') != session['oauth_state']:
+                    return "Invalid state parameter. Possible CSRF attack.", 403
+                
+                # Exchange the code for an access token
+                if 'code' not in request.args:
+                    return "Authorization code not received", 400
+                
+                code = request.args.get('code')
+                
+                response = requests.post(
+                    'https://github.com/login/oauth/access_token',
+                    data={
+                        'client_id': self.github_client_id,
+                        'client_secret': self.github_client_secret,
+                        'code': code
+                    },
+                    headers={'Accept': 'application/json'}
+                )
+                
+                if response.status_code != 200:
+                    return "Failed to exchange code for access token", 400
+                
+                token_data = response.json()
+                if 'access_token' not in token_data:
+                    return "Access token not received", 400
+                
+                # Store the token in session
+                session['github_token'] = token_data['access_token']
+                
+                # Update the instance token if needed
+                if not self.token:
+                    self.token = token_data['access_token']
+                    self.headers = {
+                        'Authorization': f'token {self.token}',
+                        'Accept': 'application/vnd.github.v3+json'
+                    }
+                    self.verify_token()
+                
+                # Get user info
+                user_response = requests.get(
+                    'https://api.github.com/user',
+                    headers={'Authorization': f"token {token_data['access_token']}"}
+                )
+                
+                if user_response.status_code != 200:
+                    return "Failed to get user information", 400
+                
+                user_data = user_response.json()
+                session['user_id'] = user_data['id']
+                session['username'] = user_data['login']
+                
+                # Redirect to the dashboard
+                return redirect(url_for('home'))
+            
+            @app.route('/logout')
+            def logout():
+                session.clear()
+                return redirect(url_for('login'))
+            
+            @app.route('/demo')
+            def demo():
+                # Set a demo flag in session
+                session['demo_mode'] = True
+                return redirect(url_for('home'))
+            
+            @app.route('/api/data')
+            @login_required
+            def get_data():
+                # Check if data refresh is needed
+                current_time = time.time()
+                if current_time - self.last_refresh_time >= self.refresh_interval:
+                    self.logger.info("Performing scheduled data refresh")
+                    self.refresh_data()
+                    self.last_refresh_time = current_time
+                
+                # Format the data for the front-end
+                profile = None
+                if self.user_data:
+                    profile = {
+                        'username': self.user_data.get('login'),
+                        'name': self.user_data.get('name'),
+                        'bio': self.user_data.get('bio'),
+                        'company': self.user_data.get('company'),
+                        'location': self.user_data.get('location'),
+                        'email': self.user_data.get('email'),
+                        'blog': self.user_data.get('blog'),
+                        'followers': self.user_data.get('followers', 0),
+                        'following': self.user_data.get('following', 0),
+                        'public_repos': self.user_data.get('public_repos', 0),
+                        'created_at': self.user_data.get('created_at'),
+                        'avatar_url': self.user_data.get('avatar_url')
+                    }
+                
+                # Format language stats
+                language_data = []
+                for lang, value in self.collected_data['language_stats'].most_common(10):
+                    language_data.append({
+                        'name': lang,
+                        'value': value
+                    })
+                
+                # Get recent repositories
+                recent_repos = []
+                for repo in sorted(self.collected_data['repositories'], 
+                                   key=lambda x: x.get('updated_at', ''), reverse=True)[:6]:
+                    recent_repos.append({
+                        'name': repo.get('name', ''),
+                        'full_name': repo.get('full_name', ''),
+                        'description': repo.get('description', ''),
+                        'url': repo.get('html_url', ''),
+                        'language': repo.get('language', ''),
+                        'stars': repo.get('stargazers_count', 0),
+                        'forks': repo.get('forks_count', 0),
+                        'private': repo.get('private', False)
+                    })
+                
                 response_data = {
-                    'profile': self.collected_data['profile'],
+                    'profile': profile,
                     'stats': {
-                        'total_repos': repos_count,
+                        'total_repos': len(self.collected_data['repositories']),
                         'total_commits': self.collected_data['total_commits'],
                         'total_prs': self.collected_data['total_prs'],
                         'total_stars': self.collected_data['total_stars']
                     },
+                    'languages': language_data,
+                    'recent_repos': recent_repos,
+                    'recent_activity': self.collected_data.get('recent_activity', []),
                     'progress': {
-                        'total_repos': total_count,
-                        'processed_repos': processed_count,
-                        'percentage': percentage,
+                        'total_repos': self.collected_data['progress']['total_repos'],
+                        'processed_repos': self.collected_data['progress']['processed_repos'],
+                        'percentage': self.collected_data['progress']['percentage'],
                         'current_repo': self.collected_data['progress']['current_repo'],
-                        'status': self.collected_data['current_status'],
-                        'rate_limit': self.rate_limit_remaining,
-                        'eta': self.collected_data['progress']['eta']
-                    },
-                    'languages': [
-                        {'name': lang, 'value': bytes_count}
-                        for lang, bytes_count in self.collected_data['language_stats'].most_common(10)
-                    ],
-                    'recent_repos': [
-                        {
-                            'name': repo['name'],
-                            'full_name': repo['full_name'],
-                            'url': repo['url'],
-                            'description': repo.get('description', ''),
-                            'stars': repo['stargazers_count'],
-                            'forks': repo['forks_count'],
-                            'language': repo.get('language', '')
-                        }
-                        for repo in sorted(self.collected_data['repositories'], 
-                                          key=lambda x: x['updated_at'], 
-                                          reverse=True)[:10]
-                    ]
+                        'rate_limit': self.collected_data['progress']['rate_limit'],
+                        'eta': self.collected_data['progress']['eta'],
+                        'status': self.collected_data['current_status']
+                    }
                 }
-                
                 return jsonify(response_data)
             
             @app.route('/reports/<path:filename>')
+            @login_required
             def reports(filename):
                 return send_from_directory(self.report_dir, filename)
             
@@ -626,7 +814,7 @@ class GitHubDataFetcher:
     def _cache_get(self, key):
         """Get item from cache if it exists and is not expired."""
         cache_path = self._get_cache_path(key)
-        if os.path.exists(cache_path):
+        if (os.path.exists(cache_path)):
             try:
                 with open(cache_path, 'r') as f:
                     cached_data = json.load(f)
@@ -651,6 +839,12 @@ class GitHubDataFetcher:
 
     def check_rate_limit(self):
         """Check and handle GitHub API rate limits."""
+        if not self.token:
+            # For unauthenticated requests, just assume we have limited capacity
+            self.rate_limit_remaining = 10
+            self.logger.warning("Running unauthenticated. Rate limits will be very restrictive.")
+            return self.rate_limit_remaining
+            
         # First check if we already have a rate limit stored
         if self.rate_limit_remaining is not None and self.rate_limit_remaining < 10:
             wait_time = self.rate_limit_reset - time.time()
@@ -695,13 +889,17 @@ class GitHubDataFetcher:
                 if self.rate_limit_remaining < 20:
                     reset_time = datetime.datetime.fromtimestamp(self.rate_limit_reset).strftime('%H:%M:%S')
                     self.collected_data['progress']['eta'] = f"Rate limit resets at {reset_time}"
+            elif response.status_code == 401:
+                self.logger.error("Failed to check rate limit: Authentication error (401)")
+                self.collected_data['current_status'] = 'Authentication Error'
+                return 0
             else:
                 self.logger.error(f"Failed to check rate limit: {response.status_code}")
                 
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Request failed when checking rate limit: {e}")
             
-        return self.rate_limit_remaining
+        return self.rate_limit_remaining if self.rate_limit_remaining is not None else 0
 
     def _make_request(self, endpoint, params=None, use_cache=True):
         """Make a request with caching and rate limit handling."""
@@ -732,6 +930,14 @@ class GitHubDataFetcher:
                 # For stats endpoints that return 202, don't treat as error
                 self.logger.info(f"Server is preparing data for {endpoint} (202)")
                 return response.status_code
+            elif response.status_code == 401:
+                self.logger.error(f"Error fetching {endpoint}: Authentication error (401)")
+                self.collected_data['current_status'] = 'Authentication Error'
+                return None
+            elif response.status_code == 403:
+                self.logger.error(f"Error fetching {endpoint}: Rate limit exceeded or insufficient permissions (403)")
+                self.collected_data['current_status'] = 'API Access Restricted'
+                return None
             else:
                 self.logger.error(f"Error fetching {endpoint}: {response.status_code}")
                 return None
@@ -747,7 +953,10 @@ class GitHubDataFetcher:
         data = self._make_request("user")
         if data:
             self.user_data = data
-        return self.user_data
+            return self.user_data
+        else:
+            self.logger.error("Failed to fetch user data")
+            return None
 
     def get_repositories(self):
         """Fetch all repositories (public and private)."""
@@ -1035,6 +1244,12 @@ class GitHubDataFetcher:
         self.logger.info("Starting data collection process")
         self.collected_data['current_status'] = 'Starting'
         
+        # Check authentication first
+        if not self.verify_token():
+            self.logger.error("GitHub token authentication failed. Cannot proceed with data collection.")
+            self.collected_data['current_status'] = 'Authentication Error'
+            return self.collected_data
+            
         # Get user profile if not already loaded
         if not self.collected_data['profile']:
             self.logger.info("Fetching user profile data...")
@@ -1042,7 +1257,7 @@ class GitHubDataFetcher:
             if not user:
                 self.logger.error("Failed to fetch user data")
                 self.collected_data['current_status'] = 'Error'
-                return None
+                return self.collected_data
                 
             self.collected_data['profile'] = {
                 'username': user['login'],
@@ -1183,6 +1398,27 @@ class GitHubDataFetcher:
                     'percentage': percentage
                 })
         
+        # Collect all pull requests across repositories
+        all_prs = []
+        for repo in data['repositories']:
+            for pr in repo['pull_requests']:
+                pr_copy = pr.copy()
+                pr_copy['repo_name'] = repo['name']
+                pr_copy['repo_full_name'] = repo['full_name']
+                pr_copy['repo_url'] = repo['url']
+                all_prs.append(pr_copy)
+        
+        # Sort pull requests by creation date (newest first)
+        all_prs.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        # Collect PR statistics
+        pr_stats = {
+            'total': len(all_prs),
+            'open': len([pr for pr in all_prs if pr['state'] == 'open']),
+            'closed': len([pr for pr in all_prs if pr['state'] == 'closed']),
+            'merged': len([pr for pr in all_prs if pr.get('merged_at')])
+        }
+        
         # Generate repository HTML
         repos_html = ""
         for repo in data['repositories']:
@@ -1239,6 +1475,48 @@ class GitHubDataFetcher:
             </div>
             """
         
+        # Generate pull requests HTML
+        pr_html = ""
+        if all_prs:
+            for pr in all_prs[:30]:  # Limit to 30 most recent PRs
+                created_at = parser.parse(pr['created_at']).strftime('%Y-%m-%d')
+                updated_at = parser.parse(pr['updated_at']).strftime('%Y-%m-%d')
+                closed_at = parser.parse(pr['closed_at']).strftime('%Y-%m-%d') if pr['closed_at'] else "N/A"
+                merged_at = parser.parse(pr['merged_at']).strftime('%Y-%m-%d') if pr.get('merged_at') else "N/A"
+                
+                # Determine status class for badge
+                badge_class = "bg-warning"  # default for open
+                if pr['state'] == 'closed':
+                    badge_class = "bg-danger"
+                if pr.get('merged_at'):
+                    badge_class = "bg-success"
+                
+                # Generate PR card
+                pr_html += f"""
+                <div class="col-md-6 mb-3">
+                    <div class="card">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <h5 class="mb-0">#{pr['number']} {pr['title']}</h5>
+                            <span class="badge {badge_class}">{pr['state'].upper()}</span>
+                        </div>
+                        <div class="card-body">
+                            <p><strong>Repository:</strong> <a href="{pr['repo_url']}" target="_blank">{pr['repo_full_name']}</a></p>
+                            <p><strong>Author:</strong> {pr['user']}</p>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <p><strong>Created:</strong> {created_at}</p>
+                                    <p><strong>Updated:</strong> {updated_at}</p>
+                                </div>
+                                <div class="col-md-6">
+                                    <p><strong>Closed:</strong> {closed_at}</p>
+                                    <p><strong>Merged:</strong> {merged_at}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """
+        
         # Create HTML report
         html = f"""
         <!DOCTYPE html>
@@ -1263,10 +1541,35 @@ class GitHubDataFetcher:
                     height: 200px;
                     width: 100%;
                 }}
+                .nav-tabs .nav-link {{
+                    font-weight: 500;
+                }}
+                .pr-stats-card {{
+                    text-align: center;
+                    padding: 15px;
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                }}
+                .pr-open {{
+                    background-color: #fff3cd;
+                    border: 1px solid #ffecb5;
+                }}
+                .pr-closed {{
+                    background-color: #f8d7da;
+                    border: 1px solid #f5c2c7;
+                }}
+                .pr-merged {{
+                    background-color: #d1e7dd;
+                    border: 1px solid #badbcc;
+                }}
+                .pr-total {{
+                    background-color: #cfe2ff;
+                    border: 1px solid #b6d4fe;
+                }}
             </style>
         </head>
         <body>
-            <div class="container mt-5">
+            <div class="container-fluid mt-4">
                 <div class="row mb-4">
                     <div class="col-md-12">
                         <h1 class="display-4">GitHub Profile Report for {data['profile']['username']}</h1>
@@ -1277,45 +1580,105 @@ class GitHubDataFetcher:
                     </div>
                 </div>
                 
-                <div class="row mb-4">
-                    <div class="col-md-4">
-                        <div class="stats-card">
-                            <h3>Profile</h3>
-                            <p><strong>Name:</strong> {data['profile']['name']}</p>
-                            <p><strong>Username:</strong> {data['profile']['username']}</p>
-                            <p><strong>Bio:</strong> {data['profile']['bio']}</p>
-                            <p><strong>Location:</strong> {data['profile']['location']}</p>
-                            <p><strong>Company:</strong> {data['profile']['company']}</p>
-                            <p><strong>Followers:</strong> {data['profile']['followers']}</p>
-                            <p><strong>Following:</strong> {data['profile']['following']}</p>
-                        </div>
-                    </div>
-                    
-                    <div class="col-md-4">
-                        <div class="stats-card">
-                            <h3>Summary Statistics</h3>
-                            <p><strong>Total Repositories:</strong> {len(data['repositories'])}</p>
-                            <p><strong>Total Commits:</strong> {data['total_commits']}</p>
-                            <p><strong>Total Pull Requests:</strong> {data['total_prs']}</p>
-                            <p><strong>Total Stars Received:</strong> {data['total_stars']}</p>
-                        </div>
-                    </div>
-                    
-                    <div class="col-md-4">
-                        <div class="stats-card">
-                            <h3>Language Distribution</h3>
-                            <div class="chart-container">
-                                <canvas id="languageChart"></canvas>
+                <!-- Nav tabs -->
+                <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="overview-tab" data-bs-toggle="tab" data-bs-target="#overview" type="button" role="tab" aria-controls="overview" aria-selected="true">Overview</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="repositories-tab" data-bs-toggle="tab" data-bs-target="#repositories" type="button" role="tab" aria-controls="repositories" aria-selected="false">Repositories</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="pullrequests-tab" data-bs-toggle="tab" data-bs-target="#pullrequests" type="button" role="tab" aria-controls="pullrequests" aria-selected="false">Pull Requests</button>
+                    </li>
+                </ul>
+                
+                <!-- Tab content -->
+                <div class="tab-content">
+                    <!-- Overview Tab -->
+                    <div class="tab-pane fade show active" id="overview" role="tabpanel" aria-labelledby="overview-tab">
+                        <div class="row">
+                            <div class="col-md-4">
+                                <div class="stats-card">
+                                    <h3>Profile</h3>
+                                    <p><strong>Name:</strong> {data['profile']['name']}</p>
+                                    <p><strong>Username:</strong> {data['profile']['username']}</p>
+                                    <p><strong>Bio:</strong> {data['profile']['bio']}</p>
+                                    <p><strong>Location:</strong> {data['profile']['location']}</p>
+                                    <p><strong>Company:</strong> {data['profile']['company']}</p>
+                                    <p><strong>Followers:</strong> {data['profile']['followers']}</p>
+                                    <p><strong>Following:</strong> {data['profile']['following']}</p>
+                                </div>
+                            </div>
+                            
+                            <div class="col-md-4">
+                                <div class="stats-card">
+                                    <h3>Summary Statistics</h3>
+                                    <p><strong>Total Repositories:</strong> {len(data['repositories'])}</p>
+                                    <p><strong>Total Commits:</strong> {data['total_commits']}</p>
+                                    <p><strong>Total Pull Requests:</strong> {data['total_prs']}</p>
+                                    <p><strong>Total Stars Received:</strong> {data['total_stars']}</p>
+                                </div>
+                            </div>
+                            
+                            <div class="col-md-4">
+                                <div class="stats-card">
+                                    <h3>Language Distribution</h3>
+                                    <div class="chart-container">
+                                        <canvas id="languageChart"></canvas>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
-                </div>
-                
-                <div class="row mb-4">
-                    <div class="col-md-12">
-                        <h2>Repository List</h2>
+                    
+                    <!-- Repositories Tab -->
+                    <div class="tab-pane fade" id="repositories" role="tabpanel" aria-labelledby="repositories-tab">
                         <div class="row">
                             {repos_html}
+                        </div>
+                    </div>
+                    
+                    <!-- Pull Requests Tab -->
+                    <div class="tab-pane fade" id="pullrequests" role="tabpanel" aria-labelledby="pullrequests-tab">
+                        <div class="row mb-4">
+                            <div class="col-md-3">
+                                <div class="pr-stats-card pr-total">
+                                    <h4>Total PRs</h4>
+                                    <h2>{pr_stats['total']}</h2>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="pr-stats-card pr-open">
+                                    <h4>Open PRs</h4>
+                                    <h2>{pr_stats['open']}</h2>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="pr-stats-card pr-closed">
+                                    <h4>Closed PRs</h4>
+                                    <h2>{pr_stats['closed']}</h2>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="pr-stats-card pr-merged">
+                                    <h4>Merged PRs</h4>
+                                    <h2>{pr_stats['merged']}</h2>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="row">
+                            <div class="col-12 mb-3">
+                                <div class="chart-container" style="height: 300px;">
+                                    <canvas id="prChart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <h3 class="mb-3">Recent Pull Requests</h3>
+                        <div class="row">
+                            {pr_html}
                         </div>
                     </div>
                 </div>
@@ -1323,8 +1686,8 @@ class GitHubDataFetcher:
             
             <script>
                 // Language chart
-                const ctx = document.getElementById('languageChart').getContext('2d');
-                const languageChart = new Chart(ctx, {{
+                const ctxLang = document.getElementById('languageChart').getContext('2d');
+                const languageChart = new Chart(ctxLang, {{
                     type: 'pie',
                     data: {{
                         labels: [{', '.join([f'"{lang["language"]}"' for lang in language_data])}],
@@ -1341,6 +1704,44 @@ class GitHubDataFetcher:
                     options: {{
                         responsive: true,
                         maintainAspectRatio: false,
+                    }}
+                }});
+                
+                // PR Status chart
+                const ctxPR = document.getElementById('prChart').getContext('2d');
+                const prChart = new Chart(ctxPR, {{
+                    type: 'bar',
+                    data: {{
+                        labels: ['Open', 'Closed', 'Merged'],
+                        datasets: [{{
+                            label: 'Pull Request Status',
+                            data: [{pr_stats['open']}, {pr_stats['closed'] - pr_stats['merged']}, {pr_stats['merged']}],
+                            backgroundColor: [
+                                '#ffc107',
+                                '#dc3545',
+                                '#198754'
+                            ],
+                            borderWidth: 1
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {{
+                            y: {{
+                                beginAtZero: true,
+                                title: {{
+                                    display: true,
+                                    text: 'Number of Pull Requests'
+                                }}
+                            }},
+                            x: {{
+                                title: {{
+                                    display: true,
+                                    text: 'Status'
+                                }}
+                            }}
+                        }}
                     }}
                 }});
             </script>
@@ -1514,25 +1915,201 @@ class GitHubDataFetcher:
         self.logger.info(f"Report saved to {filename}")
         return filename
 
+    def refresh_data(self):
+        """Refresh data by checking for new repositories and updates."""
+        if not self.token:
+            self.logger.warning("Cannot refresh data without a GitHub token")
+            return False
+        
+        self.logger.info("Starting data refresh...")
+        self.collected_data['current_status'] = 'Refreshing'
+        
+        # Get current repositories from GitHub
+        current_repos = self.fetch_user_repositories()
+        if not current_repos:
+            self.logger.error("Failed to fetch repositories during refresh")
+            self.collected_data['current_status'] = 'Refresh Error'
+            return False
+        
+        # Find new repositories
+        current_repo_names = {repo['full_name'] for repo in current_repos}
+        existing_repo_names = {repo['full_name'] for repo in self.collected_data['repositories']}
+        
+        new_repos = current_repo_names - existing_repo_names
+        removed_repos = existing_repo_names - current_repo_names
+        
+        # Get recent activity
+        self.fetch_user_activity()
+        
+        # Add new repositories
+        if new_repos:
+            self.logger.info(f"Found {len(new_repos)} new repositories to add")
+            for repo_name in new_repos:
+                for repo in current_repos:
+                    if repo['full_name'] == repo_name:
+                        self.collected_data['repositories'].append(repo)
+                        self.collected_data['progress']['current_repo'] = repo_name
+                        self.process_repository(repo)
+                        break
+        
+        # Remove deleted repositories
+        if removed_repos:
+            self.logger.info(f"Removing {len(removed_repos)} deleted repositories")
+            self.collected_data['repositories'] = [
+                repo for repo in self.collected_data['repositories'] 
+                if repo['full_name'] not in removed_repos
+            ]
+        
+        # Update existing repositories for changes
+        self.logger.info("Checking for updates to existing repositories")
+        for repo in self.collected_data['repositories']:
+            # Only check repositories updated in the last day
+            self.collected_data['progress']['current_repo'] = repo['full_name']
+            self.process_repository(repo, incremental=True)
+        
+        self.collected_data['current_status'] = 'Completed'
+        self.collected_data['last_updated'] = time.time()
+        self.save_checkpoint()
+        
+        self.logger.info("Data refresh completed successfully")
+        return True
+
+    def fetch_user_repositories(self):
+        """Fetch all repositories for the authenticated user."""
+        self.logger.info("Fetching user repositories")
+        all_repos = []
+        page = 1
+        
+        while True:
+            repos = self._make_request(
+                "user/repos",
+                params={
+                    'per_page': 100,
+                    'page': page,
+                    'sort': 'updated',
+                    'affiliation': 'owner,collaborator,organization_member'
+                }
+            )
+            
+            if not repos or len(repos) == 0:
+                break
+                
+            all_repos.extend(repos)
+            page += 1
+            
+        self.logger.info(f"Fetched {len(all_repos)} repositories")
+        return all_repos
+
+    def fetch_user_activity(self):
+        """Fetch recent activity for the authenticated user."""
+        if not self.token:
+            self.logger.warning("Cannot fetch user activity without a token")
+            return
+        
+        try:
+            response = requests.get(
+                f"{self.base_url}/users/{self.user_data['login']}/events",
+                headers=self.headers,
+                params={'per_page': 10},
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                self.logger.error(f"Failed to fetch user activity: {response.status_code}")
+                return
+            
+            events = response.json()
+            recent_activity = []
+            
+            for event in events:
+                activity = {
+                    'type': event['type'],
+                    'created_at': event['created_at'],
+                    'title': 'Activity',
+                    'repo_name': event['repo']['name']
+                }
+                
+                # Format the title based on event type
+                if event['type'] == 'PushEvent':
+                    activity['title'] = f"Pushed to {event['repo']['name']}"
+                elif event['type'] == 'PullRequestEvent':
+                    activity['title'] = f"Pull request in {event['repo']['name']}"
+                elif event['type'] == 'IssuesEvent':
+                    activity['title'] = f"Issue in {event['repo']['name']}"
+                elif event['type'] == 'CreateEvent':
+                    activity['title'] = f"Created {event['payload'].get('ref_type', '')} in {event['repo']['name']}"
+                elif event['type'] == 'ForkEvent':
+                    activity['title'] = f"Forked {event['repo']['name']}"
+                elif event['type'] == 'WatchEvent':
+                    activity['title'] = f"Starred {event['repo']['name']}"
+                
+                recent_activity.append(activity)
+            
+            self.collected_data['recent_activity'] = recent_activity
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching user activity: {e}")
 
 def main():
-    # Get GitHub token from environment, hardcoded value, or user input
+    # Get GitHub token from environment, file, or user input
     token = os.environ.get('GITHUB_TOKEN')
+    
+    # Check for token file
+    token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'github_token.txt')
+    if not token and os.path.exists(token_file):
+        try:
+            with open(token_file, 'r') as f:
+                token = f.read().strip()
+                print(f"Loaded token from {token_file}")
+        except Exception as e:
+            print(f"Error reading token file: {e}")
+    
+    # If still no token, ask user
     if not token:
-        # Option to hardcode the token here
-        token = "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"  # Replace with your token
-
-    if not token or token == "your_personal_access_token_here":
-        token = input("Enter your GitHub personal access token: ")
+        print("\n=== GitHub Authentication ===")
+        print("To access your GitHub data, you need a Personal Access Token.")
+        print("Instructions to create a token:")
+        print("1. Go to https://github.com/settings/tokens")
+        print("2. Click 'Generate new token' (classic)")
+        print("3. Give it a name like 'GitHub Data Fetcher'")
+        print("4. Select scopes: 'repo', 'read:user', 'user:email'")
+        print("5. Click 'Generate token' and copy the token\n")
+        
+        token = input("Enter your GitHub personal access token: ").strip()
+        
+        if token:
+            save = input("Save this token for future use? (y/n): ").lower()
+            if save.startswith('y'):
+                try:
+                    with open(token_file, 'w') as f:
+                        f.write(token)
+                    print(f"Token saved to {token_file}")
+                except Exception as e:
+                    print(f"Error saving token: {e}")
+        else:
+            print("No token provided. Running with limited API access.")
     
     fetcher = GitHubDataFetcher(token)
+    if fetcher.collected_data['current_status'] == 'Authentication Error':
+        print("\n⚠️  Authentication Error: Your GitHub token is invalid or has expired.")
+        print("Please check the token and try again.")
+        print(f"Web dashboard available at: {fetcher.web_server_url}")
+        
+        # Keep the server running to show the error
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Exiting...")
+        return
+        
     print("Collecting GitHub data... This may take a while depending on your repository count.")
     print(f"Live web dashboard available at: {fetcher.web_server_url}")
     
     # Collect all data
     data = fetcher.collect_all_data()
     
-    if data:
+    if data and data['profile']:
         # Generate and save markdown report
         markdown = fetcher.generate_markdown_report(data)
         filename = fetcher.save_report(markdown)
@@ -1548,6 +2125,14 @@ def main():
             print("Exiting...")
     else:
         print("Failed to collect GitHub data.")
+        print("Check the logs for more information.")
+        # Keep the server running to show the error
+        try:
+            print("\nPress Ctrl+C to exit...")
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Exiting...")
 
 
 if __name__ == "__main__":

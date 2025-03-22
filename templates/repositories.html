@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+
+{% block title %}Repositories - GitHub Data Fetcher{% endblock %}
+
+{% block extra_css %}
+<style>
+    .repo-card {
+        transition: transform 0.2s ease;
+        position: relative;
+        overflow: hidden;
+    }
+
+    .repo-card:hover {
+        transform: translateY(-2px);
+    }
+
+    .repo-card::before {
+        content: '';
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        background: radial-gradient(circle at var(--x, 50%) var(--y, 50%), 
+                                  rgba(88, 166, 255, 0.05) 0%,
+                                  transparent 70%);
+        opacity: 0;
+        transition: opacity 0.3s ease;
+        pointer-events: none;
+    }
+
+    .repo-card:hover::before {
+        opacity: 1;
+    }
+
+    .language-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 6px;
+    }
+
+    .sort-header {
+        cursor: pointer;
+    }
+
+    .sort-header:hover {
+        color: var(--accent-primary);
+    }
+
+    .sort-header.active {
+        color: var(--accent-primary);
+    }
+
+    .sort-header.active::after {
+        content: '↓';
+        margin-left: 4px;
+    }
+
+    .sort-header.active.desc::after {
+        content: '↑';
+    }
+
+    .filter-input {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        border-radius: 4px;
+        padding: 0.5rem;
+    }
+
+    .filter-input:focus {
+        border-color: var(--accent-primary);
+        outline: none;
+        box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1 class="mb-4">Repositories</h1>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-4">
+        <input type="text" 
+               id="searchInput" 
+               class="form-control filter-input w-100" 
+               placeholder="Search repositories...">
+    </div>
+    <div class="col-md-3">
+        <select id="languageFilter" class="form-select filter-input">
+            <option value="">All Languages</option>
+            {% for language in data.languages %}
+            <option value="{{ language }}">{{ language }}</option>
+            {% endfor %}
+        </select>
+    </div>
+</div>
+
+<div class="table-responsive">
+    <table class="table" id="reposTable">
+        <thead>
+            <tr>
+                <th class="sort-header" data-sort="name">Repository</th>
+                <th class="sort-header" data-sort="language">Language</th>
+                <th class="sort-header" data-sort="stars">Stars</th>
+                <th class="sort-header" data-sort="commits">Commits</th>
+                <th class="sort-header" data-sort="pulls">Pull Requests</th>
+                <th class="sort-header" data-sort="updated">Last Updated</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for repo in data.repositories %}
+            <tr class="repo-row">
+                <td>
+                    <div class="d-flex flex-column">
+                        <a href="{{ repo.html_url }}" target="_blank" class="text-accent-primary fw-bold">
+                            {{ repo.name }}
+                        </a>
+                        <small class="text-secondary">{{ repo.description }}</small>
+                    </div>
+                </td>
+                <td>
+                    {% if repo.language %}
+                    <div class="d-flex align-items-center">
+                        <span class="language-dot" style="background-color: {{ repo.language_color }}"></span>
+                        {{ repo.language }}
+                    </div>
+                    {% else %}
+                    -
+                    {% endif %}
+                </td>
+                <td data-value="{{ repo.stargazers_count }}">
+                    {{ repo.stargazers_count }}
+                </td>
+                <td data-value="{{ repo.commits_count|default(0) }}">
+                    {{ repo.commits_count|default(0) }}
+                </td>
+                <td data-value="{{ repo.pulls_count|default(0) }}">
+                    {{ repo.pulls_count|default(0) }}
+                </td>
+                <td data-value="{{ repo.updated_at }}">
+                    {{ repo.updated_at|datetime }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const table = document.getElementById('reposTable');
+    const searchInput = document.getElementById('searchInput');
+    const languageFilter = document.getElementById('languageFilter');
+    let currentSort = { column: null, direction: 'asc' };
+
+    // Handle sort headers
+    table.querySelectorAll('.sort-header').forEach(header => {
+        header.addEventListener('click', () => {
+            const column = header.dataset.sort;
+            
+            // Remove active class from all headers
+            table.querySelectorAll('.sort-header').forEach(h => {
+                h.classList.remove('active', 'desc');
+            });
+            
+            // Update sort state
+            if (currentSort.column === column) {
+                currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+                header.classList.add('active', currentSort.direction === 'desc' ? 'desc' : '');
+            } else {
+                currentSort = { column, direction: 'asc' };
+                header.classList.add('active');
+            }
+            
+            sortTable(column, currentSort.direction);
+        });
+    });
+
+    // Sort table
+    function sortTable(column, direction) {
+        const tbody = table.querySelector('tbody');
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        
+        const sortedRows = rows.sort((a, b) => {
+            let aVal = a.querySelector(`td[data-value]`).dataset.value;
+            let bVal = b.querySelector(`td[data-value]`).dataset.value;
+            
+            if (column === 'name') {
+                aVal = a.querySelector('a').textContent.trim();
+                bVal = b.querySelector('a').textContent.trim();
+            } else if (column === 'language') {
+                aVal = a.querySelector('td:nth-child(2)').textContent.trim();
+                bVal = b.querySelector('td:nth-child(2)').textContent.trim();
+            }
+            
+            if (!isNaN(aVal) && !isNaN(bVal)) {
+                aVal = Number(aVal);
+                bVal = Number(bVal);
+            }
+            
+            if (direction === 'asc') {
+                return aVal > bVal ? 1 : -1;
+            } else {
+                return aVal < bVal ? 1 : -1;
+            }
+        });
+        
+        tbody.innerHTML = '';
+        sortedRows.forEach(row => tbody.appendChild(row));
+    }
+
+    // Filter table
+    function filterTable() {
+        const searchTerm = searchInput.value.toLowerCase();
+        const language = languageFilter.value.toLowerCase();
+        
+        table.querySelectorAll('.repo-row').forEach(row => {
+            const name = row.querySelector('a').textContent.toLowerCase();
+            const description = row.querySelector('small').textContent.toLowerCase();
+            const rowLanguage = row.querySelector('td:nth-child(2)').textContent.trim().toLowerCase();
+            
+            const matchesSearch = name.includes(searchTerm) || 
+                                description.includes(searchTerm);
+            const matchesLanguage = !language || rowLanguage === language;
+            
+            row.style.display = matchesSearch && matchesLanguage ? '' : 'none';
+        });
+    }
+
+    searchInput.addEventListener('input', filterTable);
+    languageFilter.addEventListener('change', filterTable);
+
+    // Add hover effect to repo cards
+    table.querySelectorAll('.repo-row').forEach(row => {
+        row.addEventListener('mousemove', (e) => {
+            const rect = row.getBoundingClientRect();
+            const x = ((e.clientX - rect.left) / rect.width) * 100;
+            const y = ((e.clientY - rect.top) / rect.height) * 100;
+            row.style.setProperty('--x', `${x}%`);
+            row.style.setProperty('--y', `${y}%`);
+        });
+    });
+});
+</script>
+{% endblock %}
